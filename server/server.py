@@ -1,4 +1,5 @@
 import asyncio
+# pyrefly: ignore [missing-import]
 import websockets
 import json
 import sqlite3
@@ -12,7 +13,10 @@ import signal
 import re
 
 # Project root directory
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if "__file__" in globals() else os.getcwd()
+if getattr(sys, 'frozen', False):
+    ROOT_DIR = os.path.dirname(sys.executable)
+else:
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if "__file__" in globals() else os.getcwd()
 DB_FILE = os.path.join(ROOT_DIR, "db", "porta.db")
 DEFAULT_CHANNELS = ["#lobby", "#dev", "#random"]
 
@@ -743,8 +747,30 @@ def get_local_ip():
     except Exception:
         return "127.0.0.1"
 
+def ensure_ssh_key():
+    """Ensure a local SSH key exists inside the db/ directory for public tunnels to use."""
+    key_path = os.path.join(ROOT_DIR, "db", "tunnel_key")
+    if not os.path.exists(key_path):
+        logging.info("Generating a new local SSH key for public tunnels...")
+        try:
+            import subprocess
+            subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True
+            )
+            os.chmod(key_path, 0o600)
+            logging.info("Successfully generated local SSH key.")
+        except Exception as e:
+            logging.warning(f"Failed to generate local SSH key: {e}")
+            return None
+    return key_path
+
 async def start_ssh_tunnel():
     """Automate server public exposure over SSH/Ngrok with fallback options (zero dependencies)."""
+    key_path = ensure_ssh_key()
+    ssh_key_opts = ["-i", key_path] if key_path else []
     authtoken = ENV.get("NGROK_AUTHTOKEN") or os.getenv("NGROK_AUTHTOKEN")
     if authtoken:
         logging.info("Starting public internet tunnel via ngrok...")
@@ -807,7 +833,7 @@ async def start_ssh_tunnel():
     # Try localhost.run first (using the official ssh.localhost.run endpoint)
     try:
         process = await asyncio.create_subprocess_exec(
-            "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-R", "80:127.0.0.1:8765", "nokey@ssh.localhost.run",
+            "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", *ssh_key_opts, "-R", "80:127.0.0.1:8765", "nokey@ssh.localhost.run",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=subprocess.STDOUT
@@ -848,7 +874,7 @@ async def start_ssh_tunnel():
     logging.info("Starting fallback public internet tunnel via pinggy.io...")
     try:
         process = await asyncio.create_subprocess_exec(
-            "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-p", "443", "-R", "80:127.0.0.1:8765", "public@a.pinggy.io",
+            "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-p", "443", *ssh_key_opts, "-R", "80:127.0.0.1:8765", "public@a.pinggy.io",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=subprocess.STDOUT
@@ -888,7 +914,7 @@ async def start_ssh_tunnel():
     logging.info("Starting fallback public internet tunnel via serveo.net...")
     try:
         process = await asyncio.create_subprocess_exec(
-            "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-R", "80:127.0.0.1:8765", "serveo.net",
+            "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", *ssh_key_opts, "-R", "80:127.0.0.1:8765", "serveo.net",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=subprocess.STDOUT

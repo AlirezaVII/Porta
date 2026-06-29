@@ -12,6 +12,7 @@ venv.bak/
 
 # Project specific
 db/porta.db
+db/tunnel_key*
 porta.log
 
 # macOS
