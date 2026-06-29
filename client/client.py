@@ -246,18 +246,19 @@ class ChatApp(App):
             try:
                 # Auto-detect ws:// vs wss:// based on destination host.
                 # Standard local configurations use ws://, while internet tunnels require wss://.
+                host = self.server_ip.split(":")[0]
                 is_local = (
-                    self.server_ip == "localhost" or 
-                    self.server_ip == "127.0.0.1" or 
-                    self.server_ip.startswith("192.168.") or 
-                    self.server_ip.startswith("172.") or 
-                    self.server_ip.startswith("10.")
+                    host == "localhost" or 
+                    host == "127.0.0.1" or 
+                    host.startswith("192.168.") or 
+                    host.startswith("172.") or 
+                    host.startswith("10.")
                 )
                 
                 protocol = "ws" if is_local else "wss"
                 
-                # Exclude port suffix if already configured (e.g. for subdomains/domains)
-                if ":" in self.server_ip or self.server_ip.endswith(".run") or self.server_ip.endswith(".life"):
+                # Exclude port suffix if already configured or if it's a public internet tunnel
+                if not is_local or ":" in self.server_ip:
                     # Tunnels map directly to port 80/443, so no port suffix is required
                     uri = f"{protocol}://{self.server_ip}"
                 else:
@@ -269,7 +270,7 @@ class ChatApp(App):
                     ssl_context.check_hostname = False
                     ssl_context.verify_mode = ssl.CERT_NONE
                 
-                async with websockets.connect(uri, ssl=ssl_context) as ws:
+                async with websockets.connect(uri, ssl=ssl_context, open_timeout=30.0) as ws:
                     self.websocket = ws
                     self.chat_log.write("[bold green]Connected successfully![/bold green]\n")
                     self.chat_log.write("Type [bold]/help[/bold] to see list of slash commands.\n")

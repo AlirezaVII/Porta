@@ -9,6 +9,7 @@ import logging
 import time
 import subprocess
 import signal
+import re
 
 # Project root directory
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if "__file__" in globals() else os.getcwd()
@@ -661,7 +662,7 @@ async def handler(websocket):
         except Exception:
             host_values = []
         
-    is_public = any(any(dom in h.lower() for dom in ["lhr.life", "localhost.run", "serveo.net", "serveousercontent.com"]) for h in host_values)
+    is_public = any(any(dom in h.lower() for dom in ["lhr.life", "localhost.run", "serveo.net", "serveousercontent.com", "pinggy", "ngrok"]) for h in host_values)
     connection_type = "public" if is_public else "local"
 
     logging.info(f"New client connected: Scope={connection_type.upper()}, Hosts={host_values}")
@@ -743,74 +744,199 @@ def get_local_ip():
         return "127.0.0.1"
 
 async def start_ssh_tunnel():
-    """Automate server public exposure over SSH with fallback options (zero dependencies)."""
+    """Automate server public exposure over SSH/Ngrok with fallback options (zero dependencies)."""
+    authtoken = ENV.get("NGROK_AUTHTOKEN") or os.getenv("NGROK_AUTHTOKEN")
+    if authtoken:
+        logging.info("Starting public internet tunnel via ngrok...")
+        print("\n--> Launching secure public internet tunnel (via ngrok)...")
+        try:
+            # Kill any lingering ngrok processes on startup to prevent ERR_NGROK_334
+            try:
+                import subprocess
+                subprocess.run(["killall", "ngrok"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            import ssl
+            ssl._create_default_https_context = ssl._create_unverified_context
+            from pyngrok import conf, ngrok
+            # Set the auth token and region globally in default config
+            conf.get_default().auth_token = authtoken
+            
+            # Start tunnel on port 8765, trying different regions as fallback
+            regions = ["us", "eu", "ap", "in"]
+            tunnel = None
+            loop = asyncio.get_running_loop()
+            
+            for rg in regions:
+                try:
+                    logging.info(f"Attempting ngrok tunnel in region: {rg}...")
+                    conf.get_default().region = rg
+                    tunnel = await loop.run_in_executor(
+                        None, 
+                        lambda: ngrok.connect(8765, "http")
+                    )
+                    if tunnel:
+                        break
+                except Exception as ex:
+                    logging.warning(f"ngrok tunnel failed for region {rg}: {ex}")
+                    
+            if not tunnel:
+                raise Exception("Failed to establish ngrok tunnel in all attempted regions.")
+            
+            domain = tunnel.public_url.replace("https://", "").replace("http://", "")
+            logging.info(f"Public tunnel allocated domain (ngrok): {domain}")
+            
+            class NgrokProc:
+                def terminate(self):
+                    try:
+                        ngrok.disconnect(tunnel.public_url)
+                        ngrok.kill()
+                    except Exception:
+                        pass
+                async def wait(self):
+                    pass
+            
+            return domain, NgrokProc()
+        except Exception as e:
+            logging.warning(f"ngrok tunnel initialization failed: {e}")
+            print("--> Ngrok tunnel failed. Falling back to SSH options...")
+
     logging.info("Starting public internet tunnel via localhost.run...")
     print("\n--> Launching secure public internet tunnel (via localhost.run)...")
     
-    # Try localhost.run first
+    # Try localhost.run first (using the official ssh.localhost.run endpoint)
     try:
         process = await asyncio.create_subprocess_exec(
-            "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-R", "80:127.0.0.1:8765", "nokey@localhost.run",
+            "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-R", "80:127.0.0.1:8765", "nokey@ssh.localhost.run",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=subprocess.STDOUT
         )
         
+        lines_read = []
+        domain = None
         while True:
             try:
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=6.0)
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=30.0)
             except asyncio.TimeoutError:
+                logging.warning("localhost.run connection timed out waiting for output.")
                 break
             if not line:
                 break
             line_str = line.decode().strip()
-            if "localhost.run" in line_str or "lhr.life" in line_str:
-                parts = line_str.split()
-                for part in parts:
-                    if "localhost.run" in part or "lhr.life" in part:
-                        domain = part.replace("https://", "").replace("http://", "")
+            if line_str:
+                lines_read.append(line_str)
+                match = re.search(r"https?://([a-zA-Z0-9\-]+\.(?:lhr\.life|lhr\.run|localhost\.run))", line_str)
+                if match:
+                    domain = match.group(1)
+                    if domain != "admin.localhost.run":
                         logging.info(f"Public tunnel allocated domain (localhost.run): {domain}")
                         return domain, process
-                        
-        process.terminate()
-        await process.wait()
+                    
+        # If we broke out of loop without domain, it failed
+        logging.warning("localhost.run tunnel failed. Output/Errors:\n" + "\n".join(lines_read))
+        try:
+            process.terminate()
+            await process.wait()
+        except Exception:
+            pass
     except Exception as e:
         logging.warning(f"localhost.run tunnel initialization failed: {e}")
 
-    # Fallback to serveo.net (requires no local SSH keys to be registered)
-    print("--> Localhost.run tunnel failed. Trying fallback tunnel (via serveo.net)...")
+    # Fallback 1: pinggy.io
+    print("--> Localhost.run tunnel failed. Trying fallback tunnel (via pinggy.io)...")
+    logging.info("Starting fallback public internet tunnel via pinggy.io...")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-p", "443", "-R", "80:127.0.0.1:8765", "public@a.pinggy.io",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=subprocess.STDOUT
+        )
+        
+        lines_read = []
+        domain = None
+        while True:
+            try:
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logging.warning("pinggy.io connection timed out waiting for output.")
+                break
+            if not line:
+                break
+            line_str = line.decode().strip()
+            if line_str:
+                lines_read.append(line_str)
+                match = re.search(r"https?://([a-zA-Z0-9\-]+\.(?:run\.pinggy-free\.link|free\.pinggy\.net|pinggy\.link|pinggy\.net))", line_str)
+                if match:
+                    domain = match.group(1)
+                    logging.info(f"Public tunnel allocated domain (pinggy.io): {domain}")
+                    return domain, process
+                    
+        # If we broke out of loop without domain, it failed
+        logging.warning("pinggy.io tunnel failed. Output/Errors:\n" + "\n".join(lines_read))
+        try:
+            process.terminate()
+            await process.wait()
+        except Exception:
+            pass
+    except Exception as e:
+        logging.warning(f"pinggy.io tunnel initialization failed: {e}")
+
+    # Fallback 2: serveo.net
+    print("--> Pinggy.io tunnel failed. Trying fallback tunnel (via serveo.net)...")
     logging.info("Starting fallback public internet tunnel via serveo.net...")
     try:
         process = await asyncio.create_subprocess_exec(
             "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-R", "80:127.0.0.1:8765", "serveo.net",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=subprocess.STDOUT
         )
         
+        lines_read = []
+        domain = None
         while True:
             try:
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=8.0)
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=15.0)
             except asyncio.TimeoutError:
+                logging.warning("serveo.net connection timed out waiting for output.")
                 break
             if not line:
                 break
             line_str = line.decode().strip()
-            if "serveo.net" in line_str or "serveousercontent.com" in line_str:
-                parts = line_str.split()
-                for part in parts:
-                    if "serveo.net" in part or "serveousercontent.com" in part:
-                        domain = part.replace("https://", "").replace("http://", "")
-                        logging.info(f"Public tunnel allocated domain (serveo.net): {domain}")
-                        return domain, process
-                        
-        process.terminate()
-        await process.wait()
+            if line_str:
+                lines_read.append(line_str)
+                match = re.search(r"https?://([a-zA-Z0-9\-]+\.(?:serveo\.net|serveousercontent\.com))", line_str)
+                if match:
+                    domain = match.group(1)
+                    logging.info(f"Public tunnel allocated domain (serveo.net): {domain}")
+                    return domain, process
+                    
+        # If we broke out of loop without domain, it failed
+        logging.warning("serveo.net tunnel failed. Output/Errors:\n" + "\n".join(lines_read))
+        try:
+            process.terminate()
+            await process.wait()
+        except Exception:
+            pass
     except Exception as e:
         logging.error(f"Fallback serveo.net tunnel failed: {e}", exc_info=True)
 
     print("--> All public tunnel configurations failed. Starting in Local-only mode.")
     return None, None
+
+async def repair_handshake_headers(connection, request):
+    """Bypass corporate firewalls and ISP proxy blocks by dynamically restoring stripped handshake headers."""
+    conn_val = request.headers.get("Connection")
+    if not conn_val or "upgrade" not in conn_val.lower():
+        request.headers["Connection"] = "Upgrade"
+        
+    upg_val = request.headers.get("Upgrade")
+    if not upg_val or "websocket" not in upg_val.lower():
+        request.headers["Upgrade"] = "websocket"
+        
+    return None
 
 async def main():
     # Preemptive cleanup: Detect and kill any lingering process on port 8765
@@ -842,7 +968,7 @@ async def main():
     # Gracefully handle port bind errors
     try:
         show_progress("Binding WebSockets Listener to Port 8765", 0.6)
-        async with websockets.serve(handler, "0.0.0.0", 8765):
+        async with websockets.serve(handler, "0.0.0.0", 8765, process_request=repair_handshake_headers):
             logging.info("Porta Pro Server bound successfully on port 8765.")
             
             # Print configuration details in a beautiful double-bordered grid table

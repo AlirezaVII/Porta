@@ -133,6 +133,7 @@ async def run_suite():
             # Client B creates channel '#testing' in public scope
             print("\n[Test 5] Setting up Owner Kick test...")
             await ws_public_b.send(json.dumps({"type": "create", "channel": "#testing"}))
+            await ws_public_b.send(json.dumps({"type": "join", "channel": "#testing"}))
             await clear_queue(ws_public_b)
             
             # Connect Client C (harley_2) in public scope and join '#testing'
@@ -161,9 +162,17 @@ async def run_suite():
                 kicked_correctly = "kicked" in kick_system_msg.get("text", "") and kick_join_ack.get("channel") == "#lobby"
                 log_test("Kicked Client Automatically Returned to Lobby", kicked_correctly)
                 
-                # Read Client B's log (B should receive System kick confirmation)
-                kick_conf_b = json.loads(await ws_public_b.recv())
-                log_test("Owner Receives Kick Confirmation", "kicked successfully" in kick_conf_b.get("text", ""))
+                # Read Client B's log (B should receive System kick confirmation, possibly after other broadcast messages)
+                success_conf = False
+                for _ in range(5):
+                    try:
+                        msg = json.loads(await asyncio.wait_for(ws_public_b.recv(), timeout=1.0))
+                        if "kicked successfully" in msg.get("text", ""):
+                            success_conf = True
+                            break
+                    except asyncio.TimeoutError:
+                        break
+                log_test("Owner Receives Kick Confirmation", success_conf)
 
     except Exception as e:
         print(f"\n❌ Test suite execution encountered an exception: {e}")
