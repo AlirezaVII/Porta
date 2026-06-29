@@ -11,12 +11,21 @@ import time
 import subprocess
 import signal
 import re
+import shutil
 
-# Project root directory
-if getattr(sys, 'frozen', False):
-    ROOT_DIR = os.path.dirname(sys.executable)
-else:
-    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if "__file__" in globals() else os.getcwd()
+# Project root directory (frozen-aware: works for source runs AND packaged builds)
+def _resolve_root_dir():
+    # PyInstaller / GitHub Actions builds set sys.frozen. In that case __file__
+    # points inside the temporary _MEIPASS extraction dir, so .env / db / logs
+    # must instead resolve next to the actual executable, where the user can see
+    # and edit them.
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    if "__file__" in globals():
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.getcwd()
+
+ROOT_DIR = _resolve_root_dir()
 DB_FILE = os.path.join(ROOT_DIR, "db", "porta.db")
 DEFAULT_CHANNELS = ["#lobby", "#dev", "#random"]
 
@@ -48,7 +57,13 @@ def load_env():
 
 # Load config
 ENV = load_env()
-CONFIG_STATE = ENV.get("CONFIGUATION_STATE", "0").strip()
+CONFIG_STATE = (
+    os.getenv("CONFIGURATION_STATE")
+    or os.getenv("CONFIGUATION_STATE")
+    or ENV.get("CONFIGURATION_STATE")
+    or ENV.get("CONFIGUATION_STATE")  # keep the original (misspelled) key working
+    or "0"
+).strip()
 IS_PRODUCTION = (CONFIG_STATE == "1")
 
 # Setup logging
@@ -767,70 +782,111 @@ def ensure_ssh_key():
             return None
     return key_path
 
-async def start_ssh_tunnel():
-    """Automate server public exposure over SSH/Ngrok with fallback options (zero dependencies)."""
-    key_path = ensure_ssh_key()
-    ssh_key_opts = ["-i", key_path] if key_path else []
-    authtoken = ENV.get("NGROK_AUTHTOKEN") or os.getenv("NGROK_AUTHTOKEN")
-    if authtoken:
-        logging.info("Starting public internet tunnel via ngrok...")
-        print("\n--> Launching secure public internet tunnel (via ngrok)...")
-        try:
-            # Kill any lingering ngrok processes on startup to prevent ERR_NGROK_334
-            try:
-                import subprocess
-                subprocess.run(["killall", "ngrok"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
-            import ssl
-            ssl._create_default_https_context = ssl._create_unverified_context
-            from pyngrok import conf, ngrok
-            # Set the auth token and region globally in default config
-            conf.get_default().auth_token = authtoken
-            
-            # Start tunnel on port 8765, trying different regions as fallback
-            regions = ["us", "eu", "ap", "in"]
-            tunnel = None
-            loop = asyncio.get_running_loop()
-            
-            for rg in regions:
-                try:
-                    logging.info(f"Attempting ngrok tunnel in region: {rg}...")
-                    conf.get_default().region = rg
-                    tunnel = await loop.run_in_executor(
-                        None, 
-                        lambda: ngrok.connect(8765, "http")
-                    )
-                    if tunnel:
-                        break
-                except Exception as ex:
-                    logging.warning(f"ngrok tunnel failed for region {rg}: {ex}")
-                    
-            if not tunnel:
-                raise Exception("Failed to establish ngrok tunnel in all attempted regions.")
-            
-            domain = tunnel.public_url.replace("https://", "").replace("http://", "")
-            logging.info(f"Public tunnel allocated domain (ngrok): {domain}")
-            
-            class NgrokProc:
-                def terminate(self):
-                    try:
-                        ngrok.disconnect(tunnel.public_url)
-                        ngrok.kill()
-                    except Exception:
-                        pass
-                async def wait(self):
-                    pass
-            
-            return domain, NgrokProc()
-        except Exception as e:
-            logging.warning(f"ngrok tunnel initialization failed: {e}")
-            print("--> Ngrok tunnel failed. Falling back to SSH options...")
+# ==========================================================================
+# Public tunnel providers
+#
+# There are 4 providers: ngrok, localhost.run, pinggy.io, serveo.net.
+# Each provider coroutine returns (domain, process) on success or (None, None)
+# on failure. `process` must expose .terminate() and an awaitable .wait().
+# ==========================================================================
 
+# Menu order / valid provider keys
+TUNNEL_PROVIDERS = ["ngrok", "localhost.run", "pinggy", "serveo"]
+
+
+async def _start_ngrok_tunnel():
+    """Expose the server publicly via ngrok (requires NGROK_AUTHTOKEN)."""
+    authtoken = (
+        ENV.get("NGROK_AUTHTOKEN")
+        or os.getenv("NGROK_AUTHTOKEN")
+        or os.getenv("NGROK_AUTH_TOKEN")
+    )
+    if not authtoken:
+        msg = "NGROK_AUTHTOKEN is not set — cannot start the ngrok tunnel."
+        logging.warning(msg)
+        print(f"--> {msg}")
+        return None, None
+
+    logging.info("Starting public internet tunnel via ngrok...")
+    print("\n--> Launching secure public internet tunnel (via ngrok)...")
+    try:
+        # Kill any lingering ngrok processes on startup to prevent ERR_NGROK_334
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/IM", "ngrok.exe"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.run(["pkill", "-f", "ngrok"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+        import ssl
+        ssl._create_default_https_context = ssl._create_unverified_context
+        from pyngrok import conf, ngrok
+
+        # Pin the agent + config to a writable, predictable location inside the
+        # project so packaged/production builds (where ~/.config/ngrok may be
+        # missing or read-only) still work.
+        ngrok_dir = os.path.join(ROOT_DIR, "db", "ngrok")
+        os.makedirs(ngrok_dir, exist_ok=True)
+        bin_name = "ngrok.exe" if os.name == "nt" else "ngrok"
+
+        pyngrok_config = conf.get_default()
+        pyngrok_config.auth_token = authtoken
+        pyngrok_config.ngrok_path = os.path.join(ngrok_dir, bin_name)
+        pyngrok_config.config_path = os.path.join(ngrok_dir, "ngrok.yml")
+        region = ENV.get("NGROK_REGION") or os.getenv("NGROK_REGION")
+        if region:
+            pyngrok_config.region = region.strip()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: ngrok.install_ngrok(pyngrok_config))
+        # Write the token into the pinned config explicitly (ngrok v3 exits with
+        # ERR_NGROK_4018 otherwise, surfacing as "process unable to start").
+        await loop.run_in_executor(None, lambda: ngrok.set_auth_token(authtoken, pyngrok_config))
+
+        tunnel = await loop.run_in_executor(
+            None, lambda: ngrok.connect(8765, "http", pyngrok_config=pyngrok_config)
+        )
+        if not tunnel:
+            raise Exception("ngrok.connect() returned no tunnel object.")
+
+        domain = tunnel.public_url.replace("https://", "").replace("http://", "")
+        logging.info(f"Public tunnel allocated domain (ngrok): {domain}")
+
+        class NgrokProc:
+            def terminate(self):
+                try:
+                    ngrok.disconnect(tunnel.public_url)
+                    ngrok.kill()
+                except Exception:
+                    pass
+            async def wait(self):
+                pass
+
+        return domain, NgrokProc()
+    except Exception as e:
+        detail = str(e)
+        ngrok_logs = getattr(e, "ngrok_logs", None)
+        ngrok_error = getattr(e, "ngrok_error", None)
+        if ngrok_error:
+            detail = f"{detail} | {ngrok_error}"
+        logging.warning(f"ngrok tunnel initialization failed: {detail}", exc_info=True)
+        print(f"--> Ngrok tunnel failed: {detail}")
+        if ngrok_logs:
+            print("--> ngrok agent output:")
+            for log_line in ngrok_logs[-12:]:
+                line_text = getattr(log_line, "line", str(log_line))
+                logging.warning(f"[ngrok] {line_text}")
+                print(f"      {line_text}")
+    return None, None
+
+
+async def _start_localhostrun_tunnel(ssh_key_opts):
+    """Expose the server publicly via localhost.run (SSH)."""
     logging.info("Starting public internet tunnel via localhost.run...")
     print("\n--> Launching secure public internet tunnel (via localhost.run)...")
-    
-    # Try localhost.run first (using the official ssh.localhost.run endpoint)
     try:
         process = await asyncio.create_subprocess_exec(
             "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", *ssh_key_opts, "-R", "80:127.0.0.1:8765", "nokey@ssh.localhost.run",
@@ -838,9 +894,7 @@ async def start_ssh_tunnel():
             stdout=asyncio.subprocess.PIPE,
             stderr=subprocess.STDOUT
         )
-        
         lines_read = []
-        domain = None
         while True:
             try:
                 line = await asyncio.wait_for(process.stdout.readline(), timeout=30.0)
@@ -858,8 +912,6 @@ async def start_ssh_tunnel():
                     if domain != "admin.localhost.run":
                         logging.info(f"Public tunnel allocated domain (localhost.run): {domain}")
                         return domain, process
-                    
-        # If we broke out of loop without domain, it failed
         logging.warning("localhost.run tunnel failed. Output/Errors:\n" + "\n".join(lines_read))
         try:
             process.terminate()
@@ -868,10 +920,13 @@ async def start_ssh_tunnel():
             pass
     except Exception as e:
         logging.warning(f"localhost.run tunnel initialization failed: {e}")
+    return None, None
 
-    # Fallback 1: pinggy.io
-    print("--> Localhost.run tunnel failed. Trying fallback tunnel (via pinggy.io)...")
-    logging.info("Starting fallback public internet tunnel via pinggy.io...")
+
+async def _start_pinggy_tunnel(ssh_key_opts):
+    """Expose the server publicly via pinggy.io (SSH)."""
+    logging.info("Starting public internet tunnel via pinggy.io...")
+    print("\n--> Launching secure public internet tunnel (via pinggy.io)...")
     try:
         process = await asyncio.create_subprocess_exec(
             "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-p", "443", *ssh_key_opts, "-R", "80:127.0.0.1:8765", "public@a.pinggy.io",
@@ -879,9 +934,7 @@ async def start_ssh_tunnel():
             stdout=asyncio.subprocess.PIPE,
             stderr=subprocess.STDOUT
         )
-        
         lines_read = []
-        domain = None
         while True:
             try:
                 line = await asyncio.wait_for(process.stdout.readline(), timeout=15.0)
@@ -898,8 +951,6 @@ async def start_ssh_tunnel():
                     domain = match.group(1)
                     logging.info(f"Public tunnel allocated domain (pinggy.io): {domain}")
                     return domain, process
-                    
-        # If we broke out of loop without domain, it failed
         logging.warning("pinggy.io tunnel failed. Output/Errors:\n" + "\n".join(lines_read))
         try:
             process.terminate()
@@ -908,10 +959,13 @@ async def start_ssh_tunnel():
             pass
     except Exception as e:
         logging.warning(f"pinggy.io tunnel initialization failed: {e}")
+    return None, None
 
-    # Fallback 2: serveo.net
-    print("--> Pinggy.io tunnel failed. Trying fallback tunnel (via serveo.net)...")
-    logging.info("Starting fallback public internet tunnel via serveo.net...")
+
+async def _start_serveo_tunnel(ssh_key_opts):
+    """Expose the server publicly via serveo.net (SSH)."""
+    logging.info("Starting public internet tunnel via serveo.net...")
+    print("\n--> Launching secure public internet tunnel (via serveo.net)...")
     try:
         process = await asyncio.create_subprocess_exec(
             "ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", *ssh_key_opts, "-R", "80:127.0.0.1:8765", "serveo.net",
@@ -919,9 +973,7 @@ async def start_ssh_tunnel():
             stdout=asyncio.subprocess.PIPE,
             stderr=subprocess.STDOUT
         )
-        
         lines_read = []
-        domain = None
         while True:
             try:
                 line = await asyncio.wait_for(process.stdout.readline(), timeout=15.0)
@@ -938,8 +990,6 @@ async def start_ssh_tunnel():
                     domain = match.group(1)
                     logging.info(f"Public tunnel allocated domain (serveo.net): {domain}")
                     return domain, process
-                    
-        # If we broke out of loop without domain, it failed
         logging.warning("serveo.net tunnel failed. Output/Errors:\n" + "\n".join(lines_read))
         try:
             process.terminate()
@@ -947,10 +997,149 @@ async def start_ssh_tunnel():
         except Exception:
             pass
     except Exception as e:
-        logging.error(f"Fallback serveo.net tunnel failed: {e}", exc_info=True)
+        logging.error(f"serveo.net tunnel failed: {e}", exc_info=True)
+    return None, None
+
+
+def _ssh_available():
+    """True if the system 'ssh' client is present (needed by SSH providers)."""
+    return shutil.which("ssh") is not None
+
+
+# Map of SSH-based providers (all require the 'ssh' binary)
+_SSH_PROVIDERS = {
+    "localhost.run": _start_localhostrun_tunnel,
+    "pinggy": _start_pinggy_tunnel,
+    "serveo": _start_serveo_tunnel,
+}
+
+
+async def start_tunnel(provider="auto"):
+    """Start a public tunnel using the chosen provider.
+
+    provider: 'ngrok' | 'localhost.run' | 'pinggy' | 'serveo' | 'auto'
+      - A specific name uses ONLY that provider (no fallback).
+      - 'auto' tries ngrok first (if a token exists), then the SSH providers
+        in order until one succeeds.
+    Returns (domain, process) on success or (None, None).
+    """
+    provider = (provider or "auto").strip().lower()
+    key_path = ensure_ssh_key()
+    ssh_key_opts = ["-i", key_path] if key_path else []
+
+    # --- Single, explicitly chosen provider -------------------------------
+    if provider == "ngrok":
+        return await _start_ngrok_tunnel()
+
+    if provider in _SSH_PROVIDERS:
+        if not _ssh_available():
+            msg = (f"'ssh' client not found, so the {provider} tunnel cannot "
+                   "start. Install OpenSSH, or choose ngrok.")
+            logging.error(msg)
+            print(f"--> {msg}")
+            print("--> Starting in Local-only mode.")
+            return None, None
+        return await _SSH_PROVIDERS[provider](ssh_key_opts)
+
+    # --- Auto: ngrok (if token) then SSH providers as fallback ------------
+    authtoken = (
+        ENV.get("NGROK_AUTHTOKEN")
+        or os.getenv("NGROK_AUTHTOKEN")
+        or os.getenv("NGROK_AUTH_TOKEN")
+    )
+    if authtoken:
+        domain, proc = await _start_ngrok_tunnel()
+        if domain:
+            return domain, proc
+        print("--> Falling back to SSH options...")
+    else:
+        logging.info("NGROK_AUTHTOKEN not set; skipping ngrok, using SSH-based tunnels.")
+        print("--> NGROK_AUTHTOKEN not set — skipping ngrok. Trying SSH-based tunnels...")
+
+    if not _ssh_available():
+        msg = ("'ssh' client not found, so localhost.run / pinggy / serveo "
+               "tunnels cannot start. Set NGROK_AUTHTOKEN to use ngrok, or "
+               "install OpenSSH.")
+        logging.error(msg)
+        print(f"--> {msg}")
+        print("--> Starting in Local-only mode.")
+        return None, None
+
+    for name in ("localhost.run", "pinggy", "serveo"):
+        domain, proc = await _SSH_PROVIDERS[name](ssh_key_opts)
+        if domain:
+            return domain, proc
+        print(f"--> {name} tunnel failed. Trying next option...")
 
     print("--> All public tunnel configurations failed. Starting in Local-only mode.")
     return None, None
+
+
+def resolve_tunnel_choice():
+    """Decide the tunnel provider from CLI args / env, or None to ask the user.
+
+    Returns one of: 'none', 'auto', 'ngrok', 'localhost.run', 'pinggy',
+    'serveo', or None (meaning: prompt interactively).
+    """
+    valid = {"ngrok", "localhost.run", "pinggy", "serveo", "auto", "none"}
+
+    if "--no-tunnel" in sys.argv:
+        return "none"
+
+    for i, arg in enumerate(sys.argv):
+        if arg.startswith("--tunnel="):
+            val = arg.split("=", 1)[1].strip().lower()
+            return val if val in valid else "auto"
+        if arg == "--tunnel":
+            if i + 1 < len(sys.argv):
+                nxt = sys.argv[i + 1].strip().lower()
+                if nxt in valid:
+                    return nxt
+            return "auto"
+
+    env_choice = (os.getenv("TUNNEL_PROVIDER") or ENV.get("TUNNEL_PROVIDER") or "").strip().lower()
+    if env_choice in valid:
+        return env_choice
+
+    return None
+
+
+def prompt_tunnel_choice():
+    """Interactive numbered menu for picking the public tunnel provider."""
+    options = [
+        ("none",          "Local only  (no public tunnel)"),
+        ("auto",          "Auto        (ngrok, then SSH fallbacks)"),
+        ("ngrok",         "ngrok       (needs NGROK_AUTHTOKEN)"),
+        ("localhost.run", "localhost.run  (SSH)"),
+        ("pinggy",        "pinggy.io      (SSH)"),
+        ("serveo",        "serveo.net     (SSH)"),
+    ]
+
+    header = "SELECT PUBLIC TUNNEL PROVIDER"
+    body = [f"[{i}] {desc}" for i, (_, desc) in enumerate(options, start=1)]
+    width = max([len(header)] + [len(b) for b in body])
+
+    print("\n╔" + "═" * (width + 4) + "╗")
+    print(f"║  {header:<{width + 1}} ║")
+    print("╠" + "═" * (width + 4) + "╣")
+    for b in body:
+        print(f"║  {b:<{width + 1}} ║")
+    print("╚" + "═" * (width + 4) + "╝")
+
+    while True:
+        try:
+            raw = input(f"Choose an option [1-{len(options)}] (default 1): ").strip()
+        except (IOError, OSError, EOFError):
+            return "none"
+        if raw == "":
+            return options[0][0]
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1][0]
+        low = raw.lower()
+        for key, _ in options:
+            if low == key:
+                return key
+        print("--> Invalid choice. Please enter a number from the list.")
 
 async def repair_handshake_headers(connection, request):
     """Bypass corporate firewalls and ISP proxy blocks by dynamically restoring stripped handshake headers."""
@@ -971,23 +1160,21 @@ async def main():
     show_progress("Initializing SQLite Database Engine", 0.6)
     init_db()
     
-    # Check flags or prompt user (safely handling non-interactive environments)
-    enable_tunnel = False
-    if "--tunnel" in sys.argv:
-        enable_tunnel = True
-    elif "--no-tunnel" in sys.argv:
-        enable_tunnel = False
-    else:
+    # Decide which tunnel provider to use: CLI flag / env var, else ask the
+    # user with an interactive menu. Non-interactive environments fall back to
+    # Local-only safely.
+    tunnel_choice = resolve_tunnel_choice()
+    if tunnel_choice is None:
         try:
-            enable_tunnel = input("Enable public internet tunnel? (y/N): ").strip().lower() == 'y'
-        except (IOError, OSError):
-            enable_tunnel = False
-    
+            tunnel_choice = prompt_tunnel_choice()
+        except (IOError, OSError, EOFError):
+            tunnel_choice = "none"
+
     tunnel_domain = None
     tunnel_proc = None
-    if enable_tunnel:
-        show_progress("Establishing SSH Public Internet Tunnel Connection", 1.2)
-        tunnel_domain, tunnel_proc = await start_ssh_tunnel()
+    if tunnel_choice and tunnel_choice != "none":
+        show_progress("Establishing Public Internet Tunnel Connection", 1.2)
+        tunnel_domain, tunnel_proc = await start_tunnel(tunnel_choice)
         
     local_ip = get_local_ip()
     
