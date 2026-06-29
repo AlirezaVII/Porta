@@ -11,14 +11,14 @@
 </p>
 
 <p align="center">
-  <img src="assets/logo.png" width="200" alt="Porta Logo"/>
+  <img src="./assets/logo.PNG" width="200" alt="Porta Logo"/>
 </p>
 
 <h1 align="center">⚡ Porta</h1>
 <h3 align="center">A Real-Time Terminal Chat Application</h3>
 
 <p align="center">
-  <img src="assets/poster.png" width="100%" alt="Porta Poster"/>
+  <img src="./assets/poster.PNG" width="100%" alt="Porta Poster"/>
 </p>
 
 <p align="center">
